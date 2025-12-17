@@ -31,7 +31,7 @@ class Simulator:
     # history[step][rid] = position; useful for GIFs
     history: List[List[Pos]] = field(default_factory=list)
 
-    # NEW: per-robot metrics
+    # per-robot metrics
     robot_distances: Dict[int, int] = field(default_factory=dict)
     targets_collected: int = 0
     last_collection_tick: Optional[int] = None  # 1-based tick when last target collected

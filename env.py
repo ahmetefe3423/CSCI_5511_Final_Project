@@ -47,7 +47,7 @@ class WorldState:
     discovered_hidden: Set[Pos] = field(default_factory=set)
 
     # ------------------------------------------------------------------ #
-    # World generation (old-main.py style + your new placement rules)    #
+    # World generation                                                   #
     # ------------------------------------------------------------------ #
     @classmethod
     def from_config(cls, cfg: Config) -> "WorldState":
