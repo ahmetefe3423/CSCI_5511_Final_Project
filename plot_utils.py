@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-plot_utilz.py
+plot_utils.py
 
 Utility functions for plotting boxplots from batch_results CSV
 using seaborn.
 
-Usage (inside Python):
+Typical workflow:
 
-    from plot_utilz import plot_boxplots_from_csv
+1) Run batch experiments:
+       python batch_run.py
 
-    plot_boxplots_from_csv(
-        csv_path="outputs_batch/batch_results.csv",
-        group_by=["purpose", "tour_algo_name"],
-        metrics=["simulation.total_distance", "tours.avg_runtime"],
-        output_dir="outputs_batch/plots",
-        show=False,
-        x_axis_label="Experiment purpose | Tour algorithm",
-    )
+2) Plot results:
+   - From Python:
+        from plot_utils import plot_boxplots_from_csv
 
-Usage (run directly):
+        plot_boxplots_from_csv(
+            csv_path="outputs_batch/batch_results.csv",
+            group_by=["purpose", "tour_algo_name"],
+            metrics=["simulation.total_distance", "tours.avg_runtime"],
+            output_dir="outputs_batch/plots",
+            show=False,
+            x_axis_label="Experiment purpose | Tour algorithm",
+        )
 
-    python plot_utilz.py
+   - Or from the command line (using defaults at the bottom):
+        python plot_utils.py
 
-This will use the DEFAULT_* settings defined at the bottom of this file.
+Defaults are configured via the DEFAULT_* constants at the bottom.
 """
 
 from pathlib import Path
-from typing import Sequence, Optional, Union
+from typing import Sequence, Optional, Union, Dict, Any
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -37,7 +41,6 @@ import seaborn as sns
 
 PathLike = Union[str, Path]
 
-# --- choose sizes ---
 
 def plot_boxplots_from_csv(
     csv_path: PathLike,
@@ -50,7 +53,8 @@ def plot_boxplots_from_csv(
     seaborn_style: str = "whitegrid",
     palette_name: str = "colorblind",
     title_template: Optional[str] = None,
-    y_axis_labels: Optional[dict] = None, 
+    y_axis_labels: Optional[Dict[str, str]] = None,
+    log_scale: bool = True,
 ) -> None:
     """
     Read a CSV and make seaborn boxplots for given metrics grouped by given columns.
@@ -80,12 +84,22 @@ def plot_boxplots_from_csv(
         as " | ".join(group_by).
     seaborn_style : str, default "whitegrid"
         Style passed to seaborn.set_style, e.g. "whitegrid", "darkgrid".
+    palette_name : str, default "colorblind"
+        Name of seaborn color palette to use.
+    title_template : str or None, default None
+        If None: title is "{metric} by {group_by}".
+        If not None: used as title_template.format(metric=metric).
+    y_axis_labels : dict or None, default None
+        Optional mapping from metric name to pretty y-axis labels.
+    log_scale : bool, default True
+        If True, use log scale on the y-axis (good for runtimes).
+        If False, keep y-axis linear.
     """
     TITLE_FONTSIZE = 18
     AXIS_LABEL_FONTSIZE = 16
     LEGEND_FONTSIZE = 11
     MAX_LEGEND_COLS = 10
-    LEGEND_LABEL_SPACING = 0.7    
+    LEGEND_LABEL_SPACING = 0.7
 
     csv_path = Path(csv_path)
     if not csv_path.exists():
@@ -124,24 +138,24 @@ def plot_boxplots_from_csv(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_groups = df[group_label_col].nunique()
+    categories = sorted(df[group_label_col].unique())
+    n_groups = len(categories)
     x_label_text = x_axis_label if x_axis_label is not None else " | ".join(group_by)
 
     sns.set_style(seaborn_style)
     sns.set_context("paper", font_scale=1.2)
 
-    # fixed order of categories for stable colors
-    categories = sorted(df[group_label_col].unique())
-    n_categories = len(categories)
-    palette = sns.color_palette(palette_name, n_colors=n_categories)
-    palette_mapping = dict(zip(categories, palette))    
+    # Fixed order of categories for stable colors
+    palette = sns.color_palette(palette_name, n_colors=n_groups)
+    palette_mapping = dict(zip(categories, palette))
 
     for metric in metrics:
         sub = df[[group_label_col, metric]].dropna()
         if sub.empty:
             print(f"[WARN] No data for metric '{metric}' after dropping NaNs. Skipping.")
             continue
-        # ---- print median stats per group (and optional quartiles) ----
+
+        # ---- print median stats per group (and quartiles) ----
         stats = (
             sub.groupby(group_label_col)[metric]
             .agg(
@@ -159,18 +173,18 @@ def plot_boxplots_from_csv(
         width = max(6.0, figsize_per_group * max(1, n_groups))
         fig, ax = plt.subplots(figsize=(width, 6))
 
-        # seaborn boxplot with paper-friendly palette
+        # seaborn boxplot with stable categories and colors
         ax = sns.boxplot(
             data=sub,
             x=group_label_col,
             y=metric,
-            hue=group_label_col,   # <-- add this
+            hue=group_label_col,
             order=categories,
             palette=palette_mapping,
-            dodge=False,           # same boxes for each category, no dodging
+            dodge=False,
             ax=ax,
         )
-        # ax.set_title(f"{metric} by {', '.join(group_by)}")        
+
         # Title
         if title_template is None:
             title_text = f"{metric} by {', '.join(group_by)}"
@@ -178,7 +192,6 @@ def plot_boxplots_from_csv(
             title_text = title_template.format(metric=metric)
 
         ax.set_title(title_text, fontsize=TITLE_FONTSIZE, pad=28)
-
         ax.set_xlabel(x_label_text, fontsize=AXIS_LABEL_FONTSIZE)
 
         ax.set_ylabel(
@@ -188,15 +201,18 @@ def plot_boxplots_from_csv(
 
         plt.xticks(rotation=45, ha="right")
 
+        # Optional log scale on y-axis
+        if log_scale:
+            ax.set_yscale("log")
+
         # Legend: top-center, between title and axes, split into columns
         handles = [mpatches.Patch(color=palette_mapping[c], label=c) for c in categories]
         legend_ncol = min(len(handles), MAX_LEGEND_COLS)
-        ax.set_yscale('log')
         ax.legend(
             handles=handles,
-            title='',
+            title="",
             loc="upper center",
-            bbox_to_anchor=(0.5, 1.08),  # <--- move to the top (inside the figure area)
+            bbox_to_anchor=(0.5, 1.08),
             ncol=legend_ncol,
             frameon=False,
             columnspacing=LEGEND_LABEL_SPACING,
@@ -221,19 +237,13 @@ def plot_boxplots_from_csv(
 # ---------------------------------------------------------------------
 # Default behavior when running this file directly
 # ---------------------------------------------------------------------
-# data_set can be 'pathfinding', 'tours', 'target_sharing'
-data_set = 'pathfinding'
+# data_set can be 'pathfinding', 'tours', or 'target_sharing'.
+data_set = "pathfinding"
 
 data_set_str = data_set[0].upper() + data_set[1:]
 
 DEFAULT_CSV = "outputs_batch/batch_results.csv"
-#DEFAULT_GROUP_BY = ["purpose", "tour_algo_name"]
 DEFAULT_GROUP_BY = [f"{data_set}.algorithm"]
-#DEFAULT_METRICS = [
-#    "simulation.total_distance",
-#    "simulation.makespan_tick",
-#    "tours.avg_runtime",
-#]
 DEFAULT_METRICS = [
     f"{data_set}.avg_runtime",
     "simulation.total_distance",
@@ -241,7 +251,7 @@ DEFAULT_METRICS = [
 DEFAULT_OUTPUT_DIR = "outputs_batch/plots"
 DEFAULT_SHOW = False  # set to True for interactive windows
 DEFAULT_X_AXIS_LABEL = f"{data_set} algorithm"
-DEFAULT_TITLE = f'{data_set_str} Algorithm Comparison'
+DEFAULT_TITLE = f"{data_set_str} Algorithm Comparison"
 
 
 def _run_with_defaults() -> None:
@@ -268,6 +278,7 @@ def _run_with_defaults() -> None:
             "simulation.total_distance": "Total distance",
             f"{data_set}.avg_runtime": "Average runtime (s)",
         },
+        log_scale=True,
     )
 
 

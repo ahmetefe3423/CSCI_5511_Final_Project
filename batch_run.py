@@ -1,163 +1,50 @@
 #!/usr/bin/env python3
 """
+batch_run.py
+
 Batch experiment runner.
 
-This script is meant for *offline experiments* where you want to:
+- Builds a parameter grid (world + algorithm params + meta "purpose").
+- For each combination:
+    - builds Config + WorldState + Simulator
+    - runs one simulation (same logic as in main.py, but without PNG/GIF I/O)
+    - builds the same summary dict as main.py
+- Uses multiprocessing to parallelize.
+- Writes/appends to a single CSV under outputs_batch/, incrementally.
 
-- Sweep over many world / algorithm configurations.
-- Run one simulation per configuration (no PNG / GIF output).
-- Collect all metrics into a single CSV file for analysis.
-
-High-level behavior
--------------------
-
-1. Build a parameter grid (world parameters, algorithms, seeds, and a free-text "purpose").
-2. For each combination in the grid:
-   - Build Config + WorldState + Simulator.
-   - Run one simulation (same core logic as in main.py, but without I/O).
-   - Build the same kind of summary dict as main.py.
-3. Use multiprocessing to parallelize runs across CPU cores.
-4. Flatten the summary dict + parameters into a single row.
-5. Append rows to `outputs_batch/batch_results.csv`.
-
-If `outputs_batch/batch_results.csv` already exists:
-- The script reads its header.
-- Infers the column order from that header.
-- Appends new experiment rows using the same schema.
-
-Usage
------
-
-From the repo root:
-
-    python batch_run.py
-
-Then inspect the resulting CSV:
-
-    outputs_batch/batch_results.csv
-
-You can open it with pandas, Excel, or any plotting tool to compare algorithms.
+If outputs_batch/batch_results.csv already exists:
+    - read its header
+    - append new rows with the same columns
 """
+
+from __future__ import annotations
 
 import csv
 import itertools
 import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import traceback
 
 from config import Config
 from env import WorldState
 from sim import Simulator
-
-# ---------------------------------------------------------------------
-# Global settings
-# ---------------------------------------------------------------------
-
-# Upper bound for how many worker processes we spawn.
-# In main_batch() we actually use:
-#
-#   num_procs = min(CPU_COUNT, mp.cpu_count())
-#
-# so you can lower this if you're on a shared machine or laptop.
-CPU_COUNT = 4
-
-# ---------------------------------------------------------------------------
-# Algorithm choices (for documentation / reference)
-# ---------------------------------------------------------------------------
-
-# Pathfinding algorithms (see pathfinding/README.md):
-#
-#   "BFS"      - Breadth-first search on the grid (unweighted shortest paths).
-#   "AStar"    - A* search with Manhattan heuristic (optimal).
-#   "WAStar"   - Weighted A* (bounded-suboptimal, typically fewer expansions).
-#   "GBFS"     - Greedy best-first search (very fast, not optimal).
-#   "IDAStar"  - Iterative Deepening A* (low memory, optimal).
-#   "SMAStar"  - Simplified memory-bounded A*.
-#
-# Target-sharing (auction) algorithms (see target_sharing/README.md):
-#
-#   "RoundRobin"      - Baseline: assigns targets in round-robin order (no distances).
-#   "PSA"             - Parallel Single-Item Auctions (one bid per target, per robot).
-#   "SSA"             - Sequential Single-Item Auctions (uses tour costs PC(r, S)).
-#   "CA_Optimal"      - Single-round Combinatorial Auction, exact (small target sets).
-#   "CA_Greedy"       - Greedy Combinatorial Auction (approximate).
-#   "CA_IsingFull"    - CA winner determination via full-precision Ising/QUBO (TabuSampler).
-#   "CA_IsingLimited" - CA winner determination via integer QUBO [-7,7],
-#                       simulating 49-spin, 50µs, 24mW hardware and logging HW stats.
-#
-# Tour / TSP algorithms (see tours/README.md), used only when sharing algorithm
-# needs tour costs:
-#
-#   Used by:
-#     - "SSA"
-#     - "CA_Optimal"
-#     - "CA_Greedy"
-#     - "CA_IsingFull"
-#     - "CA_IsingLimited"
-#
-#   Ignored by:
-#     - "RoundRobin"
-#     - "PSA"
-#
-#   Options:
-#     "NearestNeighbor"    - Simple nearest-neighbor heuristic (fast, approximate).
-#     "ExactBruteForce"    - Exact TSP for small target sets (slow but optimal).
-#     "CheapestInsertion"  - Cheapest-insertion heuristic (similar to what many papers use).
-#     "IsingFull"          - QUBO Ising tour via TabuSampler (no artificial limits).
-#     "IsingLimited"       - Hardware-style Ising: integer coeffs in [-7,7],
-#                            simulated 49-spin, 50µs, 24mW hardware.
+from batch_config import PARAM_GRID, CPU_COUNT  # user-editable batch settings
+import traceback
 
 
 # ---------------------------------------------------------------------
-# 1) Parameter grid
+# 1) Parameter combinations
 # ---------------------------------------------------------------------
-
-# PARAM_GRID defines the cartesian product of experiments to run.
-#
-# Each key corresponds to a keyword argument of run_single_experiment().
-# Each value is a list; we take the product of all lists.
-#
-# 'purpose' is a free-text label that will be included in each CSV row.
-
-# PARAM_GRID will run all permutations of given parameters
-# add values inside the list, like 
-# "rows":[20,30]
-# "cols":[20,30]
-# this will run 4 different worlds, with rows=20/cols=20, rows=20/cols=30, rows=30/cols=20, rows=30/cols=30
-# be careful about adding many trials, experiment count scale exponentially
-PARAM_GRID: Dict[str, List[Any]] = {
-    # --- meta ---
-    "purpose": ["sharing_algorithm_comparison"],  # free-text label to tag this batch of experiments
-
-    # --- world parameters ---
-    "rows": [20],                     # number of grid rows in the world
-    "cols": [20],                     # number of grid columns in the world
-    "n_robots": [1],                  # how many robots are spawned in each world
-    "n_targets": [10],                # how many targets must be collected in each run
-    "known_obstacle_density": [0.2],  # fraction of cells that start as known (visible) obstacles
-    "unknown_obstacle_density": [0.0, 0.1],  # fraction of cells that are hidden obstacles, discovered via sensing
-    "sense_radius": [1],              # Manhattan sensing radius for each robot’s local sensor
-    "max_steps": [200],               # maximum number of simulation ticks before we force-terminate a run
-
-    # --- algorithms ---
-    # "path_algo_name": ["BFS","AStar","WAStar","GBFS","IDAStar","SMAStar"],
-    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],  # which pathfinding algorithms to compare
-
-    # "sharing_algo_name": ["RoundRobin","PSA","SSA","CA_Optimal","CA_Greedy","CA_IsingFull","CA_IsingLimited"],
-    "sharing_algo_name": ["CA_Optimal"],  # target-sharing algorithm (fixed here so we isolate pathfinding effects)
-
-    # "tour_algo_name": ["ExactBruteForce","CheapestInsertion","NearestNeighbor","IsingFull","IsingLimited"],
-    "tour_algo_name": ["ExactBruteForce"],  # tour/TSP algorithm used for PC(r, S) by SSA / CA_* (fixed to exact here)
-
-    # --- randomness ---
-    "seed": [i for i in range(10)],  # list of RNG seeds to generate different random worlds for each setting
-}
-
 
 
 def iter_param_combinations(grid: Dict[str, List[Any]]):
-    """Yield dicts for each combination in the parameter grid."""
+    """
+    Yield dicts for each combination in the parameter grid.
+
+    Example:
+        grid = {"rows": [20, 30], "cols": [20, 30]}
+        -> yields 4 dicts with all (rows, cols) pairs.
+    """
     keys = list(grid.keys())
     value_lists = [grid[k] for k in keys]
     for combo in itertools.product(*value_lists):
@@ -168,6 +55,7 @@ def iter_param_combinations(grid: Dict[str, List[Any]]):
 # 2) Helper: flatten nested dicts (for CSV columns)
 # ---------------------------------------------------------------------
 
+
 def flatten_dict(
     d: Dict[str, Any],
     parent_key: str = "",
@@ -176,7 +64,8 @@ def flatten_dict(
     """
     Turn nested dicts into a flat dict with dotted keys:
 
-        {"a": {"b": 1}, "c": 2}  ->  {"a.b": 1, "c": 2}
+        {"a": {"b": 1}, "c": 2}
+        -> {"a.b": 1, "c": 2}
     """
     items: Dict[str, Any] = {}
     for k, v in d.items():
@@ -189,11 +78,12 @@ def flatten_dict(
 
 
 # ---------------------------------------------------------------------
-# 3) One experiment: this is your old main(), minus I/O
+# 3) One experiment: like main(), but no images/GIFs, returns metrics
 # ---------------------------------------------------------------------
 
+
 def run_single_experiment(
-    purpose: str,                # meta label, not used in sim, just for CSV
+    purpose: str,                # meta label, not used in sim; only for CSV
     rows: int,
     cols: int,
     n_robots: int,
@@ -210,12 +100,12 @@ def run_single_experiment(
     """
     Run ONE simulation with the given parameters and return a flat dict of metrics.
 
-    This is basically your main(), but:
+    This is essentially main(), but:
       - no run_dir, no images/GIFs
       - returns metrics instead of writing files
     """
 
-    # --- build config (from your main.py) ---
+    # --- build config (mirrors main.py) ---
     cfg = Config(
         rows=rows,
         cols=cols,
@@ -231,27 +121,31 @@ def run_single_experiment(
     # --- world ---
     world = WorldState.from_config(cfg)
 
-    # record targets
-    initial_target_cells = set(world.targets)       # only used for counts
+    # record targets for counts
+    initial_target_cells = set(world.targets)
     initial_target_count = len(world.targets)
 
     # --- simulator ---
+    # log_events=False in batch to avoid spamming stdout
     sim = Simulator(
         cfg=cfg,
         world=world,
         path_algo_name=path_algo_name,
         sharing_algo_name=sharing_algo_name,
         tour_algo_name=tour_algo_name,
+        log_events=False,
     )
 
     # reset timing stats
     sim.path_algo.reset_stats()
     sim.sharing_algo.reset_stats()
-    
+    if getattr(sim, "tour_algo", None) is not None:
+        sim.tour_algo.reset_stats()
+
     # run sim
     sim.run()
 
-    # --- build summary (same logic as your main.py, just no saving) ---
+    # --- build summary (same logic as in main.py, minus images) ---
 
     pa = sim.path_algo
     sa = sim.sharing_algo
@@ -321,7 +215,7 @@ def run_single_experiment(
 
     summary["target_sharing"] = ts_entry
 
-    # Tours metrics (plus hardware if available)
+    # Tours metrics (plus hardware / SNN if available)
     if ta is not None:
         tours_entry: Dict[str, Any] = {
             "algorithm": ta.name,
@@ -341,18 +235,26 @@ def run_single_experiment(
                 "power_W": ta.HW_POWER_W,
             }
 
+        if hasattr(ta, "total_sim_time"):
+            tours_entry["SNN"] = {
+                "total_event_count": ta.total_event_count,
+                "total_sim_time": ta.total_sim_time,
+            }
+
         summary["tours"] = tours_entry
 
-    # Flatten nested summary for CSV
+    # Flatten nested summary for CSV columns
     flat_summary = flatten_dict(summary)
 
-    # We do NOT include 'purpose' here; it comes from params and will be merged outside.
+    # IMPORTANT: we do NOT include 'purpose' here;
+    # it comes from PARAM_GRID and will be merged in run_one().
     return flat_summary
 
 
 # ---------------------------------------------------------------------
-# 4) Worker for multiprocessing
+# 4) Worker wrapper for multiprocessing
 # ---------------------------------------------------------------------
+
 
 def run_one(params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -362,7 +264,7 @@ def run_one(params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     - Returns merged {params..., flat_summary...} dict.
     - If the run fails, returns None and prints an error.
     """
-    params = dict(params)
+    params = dict(params)  # make a shallow copy
 
     try:
         metrics = run_single_experiment(**params)
@@ -383,11 +285,12 @@ def run_one(params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # 5) Batch driver: incremental CSV writing in outputs_batch/
 # ---------------------------------------------------------------------
 
-def main_batch():
+
+def main_batch() -> None:
     combos = list(iter_param_combinations(PARAM_GRID))
     total = len(combos)
     if total == 0:
-        print("No parameter combinations to run. Check PARAM_GRID.")
+        print("No parameter combinations to run. Check PARAM_GRID in batch_config.py.")
         return
 
     print(f"Total experiments to run: {total}")
@@ -419,6 +322,9 @@ def main_batch():
         print("Running first job synchronously to infer CSV columns...")
         first_row = run_one(first_params)
 
+        if first_row is None:
+            raise RuntimeError("First experiment failed; cannot infer CSV columns.")
+
         fieldnames = sorted(first_row.keys())
         # Ensure 'purpose' is the first column if present
         if "purpose" in fieldnames:
@@ -444,13 +350,20 @@ def main_batch():
         print("No remaining experiments to run; done.")
         return
 
-    print(f"Running remaining {remaining_total} experiments in parallel using {CPU_COUNT} CPUs ...")
+    print(f"Running remaining {remaining_total} experiments in parallel...")
+
+    # Decide how many processes to use:
+    # - If CPU_COUNT is None, fall back to mp.cpu_count().
+    # - Otherwise, use the user-specified number from batch_config.py.
+    n_procs = CPU_COUNT if CPU_COUNT is not None else mp.cpu_count()
+    print(f"Using {n_procs} worker processes.")
 
     done = start_index
-    # Open file in append mode
+
+    # Open file in append mode and stream rows as they complete
     with out_path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        with mp.Pool(processes=mp.cpu_count()) as pool:
+        with mp.Pool(processes=n_procs) as pool:
             for row in pool.imap_unordered(run_one, remaining):
                 if row is None:
                     # this run failed; already logged, so just skip it
@@ -461,7 +374,6 @@ def main_batch():
                 done += 1
                 if done % 10 == 0 or done == total:
                     print(f"Completed {done}/{total} experiments")
-
 
     print(f"All done. Results in {out_path}")
 

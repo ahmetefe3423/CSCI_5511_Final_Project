@@ -7,6 +7,8 @@ The simulator uses the selected pathfinding algorithm for:
 - Robot motion planning on the current **belief** map
 - Distance estimates used by tour / auction algorithms (PC(r, S))
 
+The algorithm is selected by the `path_algo_name` field of the `Config` dataclass in `config.py` (single-run experiments) and by the `path_algo_name` entry in `PARAM_GRID` in `batch_config.py` (batch experiments).
+
 ---
 
 ## Available algorithms
@@ -48,8 +50,17 @@ The simulator uses the selected pathfinding algorithm for:
   - Discards the worst nodes when memory is full
 - Not a fully textbook SMA*, but captures the practical behavior of an A*-like planner under tight memory constraints
 
-> To choose the algorithm, set `path_algo_name` in `main.py` to one of:
-> `"BFS"`, `"AStar"`, `"WAStar"`, `"GBFS"`, `"IDAStar"`, or `"SMAStar"`.
+For single-run simulations, the algorithm name is set in `config.py`, for example:
+
+```python
+# config.py
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    # ...
+    path_algo_name: str = "AStar"   # one of: "BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"
+```
 
 ---
 
@@ -75,53 +86,77 @@ Behavior:
   - `total_runtime` – accumulated seconds spent in `plan`
   - `call_count` – how many times `plan` was called
   - (Many implementations also track `last_runtime`)
-- The simulator uses these fields for performance statistics in `summary.json` and **batch results**.
+- The simulator uses these fields for performance statistics in `summary.json` and in the batch-results CSV.
 
 ---
 
-## Using pathfinding algorithms in `batch_run.py`
+## Pathfinding in batch experiments (`batch_run.py` + `batch_config.py`)
 
-To compare these algorithms systematically, use `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
+Systematic comparison of pathfinding algorithms is performed via `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
 
-In `batch_run.py` the pathfinding dimension is controlled by:
+The relevant configuration lives in `batch_config.py`:
 
 ```python
+# batch_config.py
+from typing import Dict, List, Any
+
+CPU_COUNT: int | None = None  # None -> use all available cores
+
 PARAM_GRID: Dict[str, List[Any]] = {
-    # ...
+    # --- meta ---
+    "purpose": ["pathfinding_comparison"],
+
+    # --- world parameters ---
+    "rows": [20],
+    "cols": [20],
+    "n_robots": [1],
+    "n_targets": [10],
+    "known_obstacle_density": [0.2],
+    "unknown_obstacle_density": [0.0, 0.1],
+    "sense_radius": [1],
+    "max_steps": [200],
 
     # --- algorithms ---
-    # "path_algo_name": ["BFS","AStar","WAStar","GBFS","IDAStar","SMAStar"],
-    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],  # which pathfinding algorithms to compare
+    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],
+    "sharing_algo_name": ["CA_Optimal"],      # fixed to isolate pathfinding effects
+    "tour_algo_name": ["ExactBruteForce"],    # fixed to exact tour costs
 
-    # Fix sharing/tour algorithms if you want to isolate pathfinding effects:
-    "sharing_algo_name": ["CA_Optimal"],
-    "tour_algo_name": ["ExactBruteForce"],
-
-    # ...
+    # --- randomness ---
+    "seed": [i for i in range(10)],
 }
 ```
 
 Notes:
 
-- `PARAM_GRID` runs **all combinations** of the lists. If you keep `sharing_algo_name` and `tour_algo_name` at length 1 and only expand `path_algo_name`, you get a clean **pathfinding sweep** on the same worlds.
-- Each run contributes a row where:
-  - `pathfinding.algorithm` is the algorithm’s `name`
-  - `pathfinding.total_runtime` / `pathfinding.avg_runtime` capture its planning cost
-  - `simulation.total_distance` and `simulation.makespan_tick` capture the effect on overall performance
+- `PARAM_GRID` runs **all combinations** of the lists.  
+  Keeping `sharing_algo_name` and `tour_algo_name` fixed and expanding only `path_algo_name` produces a clean pathfinding sweep on matched worlds.
+- For each run, the batch driver records:
+  - `pathfinding.algorithm` – algorithm name
+  - `pathfinding.call_count`, `pathfinding.total_runtime`, `pathfinding.avg_runtime`
+  - `simulation.total_distance`, `simulation.makespan_tick`, and other metrics
 
-You can then visualize these comparisons with `plot_utils.py`, for example:
+The script `plot_utils.py` can then be used to produce boxplots comparing pathfinding algorithms, by setting `data_set = "pathfinding"`.
 
-```bash
-python plot_utils.py
+Example programmatic call:
+
+```python
+from plot_utils import plot_boxplots_from_csv
+
+plot_boxplots_from_csv(
+    csv_path="outputs_batch/batch_results.csv",
+    group_by=["pathfinding.algorithm"],
+    metrics=["pathfinding.avg_runtime", "simulation.total_distance"],
+    output_dir="outputs_batch/plots",
+    show=False,
+    x_axis_label="Pathfinding algorithm",
+)
 ```
-
-with `data_set = "pathfinding"` to get boxplots of `pathfinding.avg_runtime` and `simulation.total_distance` grouped by `pathfinding.algorithm`.
 
 ---
 
 ## Adding a new pathfinding algorithm
 
-To add your own planner:
+To add an additional planner:
 
 1. Create a new file in this folder, for example `my_planner.py`.
 2. Implement a class that follows the interface:
@@ -147,7 +182,7 @@ class MyPlanner(PathfindingAlgorithm):
     def plan(self, world: WorldState, start: Pos, goal: Pos) -> list[Pos]:
         t0 = perf_counter()
 
-        # TODO: your planning logic here
+        # Planning logic
         path: list[Pos] = []
 
         dt = perf_counter() - t0
@@ -163,18 +198,11 @@ class MyPlanner(PathfindingAlgorithm):
 ALGORITHM = MyPlanner()
 ```
 
-4. The `pathfinding/__init__.py` module will **auto-discover** this file and register it by name.
-5. You can then select it in `main.py`:
+4. The module `pathfinding/__init__.py` will **auto-discover** this file and register it under `MyPlanner.name`.
+5. The new planner can then be selected by setting
 
-```python
-path_algo_name = "MyPlanner"
-```
-
-6. To include it in batch experiments, add its name to `PARAM_GRID["path_algo_name"]` in `batch_run.py` and re-run:
-
-```python
-"path_algo_name": ["BFS", "AStar", "MyPlanner"]
-```
+   - `Config.path_algo_name = "MyPlanner"` in `config.py` (single runs), and/or
+   - adding `"MyPlanner"` to `PARAM_GRID["path_algo_name"]` in `batch_config.py` (batch experiments).
 
 ---
 
@@ -182,9 +210,9 @@ path_algo_name = "MyPlanner"
 
 - All planners operate on the **current belief map**:
   - robots only know discovered obstacles and any globally known static obstacles;
-  - hidden obstacles only affect planning once discovered.
+  - hidden obstacles only affect planning once they have been sensed.
 - Planners must respect:
   - grid boundaries,
-  - obstacles encoded in `world` (via `visible_obstacles()` or `neighbors4_visible()`),
+  - obstacles encoded in the world (via `visible_obstacles()` or `neighbors4_visible()`),
   - and the common return convention: a simple list of `(x, y)` positions, `[]` if no path exists.
-- More advanced incremental algorithms (e.g., D* Lite, LPA*) can be added as long as they fit the same `plan(world, start, goal) -> list[Pos]` interface and expose timing stats so they can be compared fairly in `summary.json` and `batch_results.csv`.
+- More advanced incremental algorithms (e.g., D* Lite, LPA*) can be added as long as they fit the same `plan(world, start, goal) -> list[Pos]` interface and expose timing statistics so they can be compared fairly in `summary.json` and in `outputs_batch/batch_results.csv`.

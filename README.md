@@ -1,6 +1,6 @@
 # Multi-Robot Gridworld: Auctions & Ising Baselines
 
-This repo is a **course project framework** for experimenting with:
+This repository is a **course project framework** for experimenting with:
 
 - Multi-robot pathfinding on a grid
 - Target allocation via auction algorithms (PSA, SSA, CA, …)
@@ -10,7 +10,7 @@ This repo is a **course project framework** for experimenting with:
 Robots start near a spawn point in a 2D grid world, must visit targets, and navigate around:
 
 - **Known obstacles** (black): known from the start  
-- **Unknown obstacles** (yellow): only discovered locally during execution
+- **Unknown obstacles** (yellow): discovered locally during execution
 
 When robots discover unknown obstacles, the system can **re-plan paths** and **re-run auctions**.
 
@@ -19,11 +19,119 @@ Each run produces a dedicated output folder with:
 - World visualizations (PNG)
 - A GIF animation of the run
 - A JSON summary of metrics and timing
-- A JSON dump of the config used
+- A JSON dump of the configuration used
 
 ---
 
-## Quick start
+## Single-run workflow: `main.py` + `config.py`
+
+Single simulations are driven by:
+
+- `config.py` – central place for all world, simulation, and algorithm choices
+- `main.py` – entry point that reads `Config`, runs one simulation, and saves outputs
+
+### Configuration (`config.py`)
+
+`config.py` defines a `Config` dataclass that holds:
+
+- Grid size, number of robots, number of targets  
+- Known / unknown obstacle densities  
+- Sensing radius and random seed  
+- Maximum number of simulation steps  
+- Algorithm names for:
+  - pathfinding (`path_algo_name`)
+  - target sharing (`sharing_algo_name`)
+  - tour / TSP (`tour_algo_name`)
+- Optional toggles such as `log_events`
+
+Example (simplified):
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Config:
+    rows: int = 20
+    cols: int = 20
+    n_robots: int = 2
+    n_targets: int = 10
+
+    known_obstacle_density: float = 0.25
+    unknown_obstacle_density: float = 0.0
+
+    sense_radius: int = 1
+    seed: int = 1
+
+    min_connected_ratio: float = 0.5
+    max_obstacle_tries: int = 50
+
+    max_steps: int = 200
+
+    # Algorithm names (must match .name fields)
+    path_algo_name: str = "AStar"
+    sharing_algo_name: str = "PSA"
+    tour_algo_name: Optional[str] = "CheapestInsertion"
+
+    # Optional logging flag for main.py runs
+    log_events: bool = True
+```
+
+### Entry point (`main.py`)
+
+`main.py` obtains a configuration instance and wires up the simulation:
+
+```python
+from config import Config
+from env import WorldState
+from sim import Simulator
+from io_utils import make_run_dir, save_config, save_summary
+from viz import draw_world
+from animate import animate_run
+
+def main() -> None:
+    cfg = Config()  # all choices taken from config.py
+
+    path_algo_name = cfg.path_algo_name
+    sharing_algo_name = cfg.sharing_algo_name
+    tour_algo_name = cfg.tour_algo_name
+    log_events = cfg.log_events
+
+    run_dir = make_run_dir(
+        cfg,
+        base="outputs",
+        path_algo_name=path_algo_name,
+        sharing_algo_name=sharing_algo_name,
+        tour_algo_name=tour_algo_name,
+    )
+    save_config(cfg, run_dir)
+
+    world = WorldState.from_config(cfg)
+    initial_target_cells = set(world.targets)
+
+    draw_world(world, cfg, out_path=run_dir / "world_initial.png")
+
+    sim = Simulator(
+        cfg=cfg,
+        world=world,
+        path_algo_name=path_algo_name,
+        sharing_algo_name=sharing_algo_name,
+        tour_algo_name=tour_algo_name,
+        log_events=log_events,
+    )
+    sim.path_algo.reset_stats()
+    sim.sharing_algo.reset_stats()
+    if getattr(sim, "tour_algo", None) is not None:
+        sim.tour_algo.reset_stats()
+
+    sim.run()
+    draw_world(world, cfg, out_path=run_dir / "world_final.png")
+    # summary.json and animation.gif are generated here
+```
+
+All world- and algorithm-level decisions are therefore made via `config.py`; `main.py` only reads them and runs the simulation.
+
+### Quick start
 
 ```bash
 # (optional) create a virtual environment
@@ -33,7 +141,7 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 
-# Optional: only needed if you use Ising-based algorithms
+# Optional: only needed for Ising-based algorithms
 pip install dwave-tabu
 
 python main.py
@@ -51,47 +159,49 @@ outputs/
     └── animation.gif
 ```
 
-(You can change the base directory by passing `base=` to `io_utils.make_run_dir`.)
+(The base directory can be changed by passing `base=` to `io_utils.make_run_dir`.)
 
 ---
 
-## Choosing algorithms
+## Algorithm choices
 
-At the top of `main.py` you select algorithms by **name**:
+Algorithm names in `config.py` must match the `.name` fields exposed by the modules in `pathfinding/`, `target_sharing/`, and `tours/`.
 
-```python
-# Pathfinding:
-#   "BFS"      - breadth-first search baseline
-#   "AStar"    - A* with Manhattan heuristic (optimal)
-#   "WAStar"   - Weighted A* (bounded-suboptimal, typically faster)
-#   "GBFS"     - Greedy best-first search (fast, not optimal)
-#   "IDAStar"  - Iterative Deepening A* (low memory, optimal)
-#   "SMAStar"  - Simplified memory-bounded A*
-path_algo_name = "AStar"
+### Pathfinding (`pathfinding/`)
 
-# Target sharing (auction):
-#   "RoundRobin"      - simple baseline
-#   "PSA"             - Parallel Single-Item Auction
-#   "SSA"             - Sequential Single-Item Auction (uses tours)
-#   "CA_Optimal"      - Exact combinatorial auction (small instances)
-#   "CA_Greedy"       - Greedy combinatorial auction
-#   "CA_IsingFull"    - CA winner determination via full-precision Ising/QUBO
-#   "CA_IsingLimited" - CA winner determination via integer QUBO [-7,7]
-sharing_algo_name = "PSA"
+Typical options:
 
-# Tour (TSP-style) solver, used by SSA / CA_*:
-#   None                - no tour model (single-target distances only)
-#   "NearestNeighbor"   - greedy TSP heuristic
-#   "CheapestInsertion" - insertion heuristic TSP
-#   "ExactBruteForce"   - exact tour (small target sets)
-#   "IsingFull"         - Ising-based tour via TabuSampler
-#   "IsingLimited"      - hardware-limited Ising tour
-tour_algo_name = "CheapestInsertion"
-```
+- `"BFS"`      – Breadth-first search baseline (unweighted shortest paths)
+- `"AStar"`    – A* with Manhattan heuristic (optimal)
+- `"WAStar"`   – Weighted A* (bounded-suboptimal, typically fewer expansions)
+- `"GBFS"`     – Greedy best-first search (fast, not optimal)
+- `"IDAStar"`  – Iterative Deepening A* (low memory, optimal)
+- `"SMAStar"`  – Simplified memory-bounded A*
 
-World / robot / target parameters (grid size, number of robots, number of targets, etc.) live in `config.py` and are read by `main.py`.
+### Target sharing / auctions (`target_sharing/`)
 
-For more details on the path planners themselves, see `pathfinding/README.md`.
+Typical options:
+
+- `"RoundRobin"`      – simple baseline
+- `"PSA"`             – Parallel Single-Item Auction
+- `"SSA"`             – Sequential Single-Item Auction (uses tours)
+- `"CA_Optimal"`      – Exact combinatorial auction (small instances)
+- `"CA_Greedy"`       – Greedy combinatorial auction
+- `"CA_IsingFull"`    – CA winner determination via full-precision Ising/QUBO
+- `"CA_IsingLimited"` – CA winner determination via integer QUBO [-7, 7]
+
+### Tour / TSP solvers (`tours/`)
+
+Used by SSA and CA-based sharing algorithms:
+
+- `None`                – no tour model (single-target distances only)
+- `"NearestNeighbor"`   – greedy TSP heuristic
+- `"CheapestInsertion"` – insertion heuristic TSP
+- `"ExactBruteForce"`   – exact tour (small target sets)
+- `"IsingFull"`         – Ising-based tour via TabuSampler
+- `"IsingLimited"`      – hardware-limited Ising tour
+
+Detailed descriptions of individual algorithms are documented in the `README.md` files inside `pathfinding/`, `target_sharing/`, and `tours/`.
 
 ---
 
@@ -117,64 +227,45 @@ Each run from `main.py` writes into its run folder:
 
 ---
 
-## Batch experiments (`batch_run.py`)
+## Batch experiments (`batch_run.py` + `batch_config.py`)
 
-For running many configurations and collecting results into a single CSV, use:
+For running many configurations and collecting results into a single CSV, batch experiments are driven by:
 
-```bash
-python batch_run.py
-```
+- `batch_config.py` – CPU count and parameter grid (`CPU_COUNT`, `PARAM_GRID`)
+- `batch_run.py` – driver script that reads `batch_config.py`, runs simulations, and writes `outputs_batch/batch_results.csv`
 
-`batch_run.py`:
+### Batch configuration (`batch_config.py`)
 
-- Builds a parameter grid (`PARAM_GRID`) over world settings, algorithms, and seeds.
-- For each combination:
-  - builds `Config + WorldState + Simulator`
-  - runs one simulation (same core logic as in `main.py`, but without PNG/GIF output)
-  - builds the same nested `summary` dict as `main.py`
-- Uses multiprocessing to parallelize experiments.
-- Flattens `{params + summary}` into one row per run.
-- Writes/appends rows to a single CSV file under `outputs_batch/`:
-
-```text
-outputs_batch/
-└── batch_results.csv
-```
-
-If `outputs_batch/batch_results.csv` already exists, new experiments are appended (reusing the existing header).
-
-### Configuring `PARAM_GRID`
-
-At the top of `batch_run.py` you’ll find something like:
+`batch_config.py` centralizes all batch-related settings.
 
 ```python
+from typing import Dict, List, Any
+
+# CPU usage for batch_run.py
+# If CPU_COUNT is None, batch_run.py will use mp.cpu_count().
+CPU_COUNT: int | None = None
 
 PARAM_GRID: Dict[str, List[Any]] = {
     # --- meta ---
-    "purpose": ["sharing_algorithm_comparison"],  # free-text label to tag this batch of experiments
+    "purpose": ["sharing_algorithm_comparison"],
 
     # --- world parameters ---
-    "rows": [20],                     # number of grid rows in the world
-    "cols": [20],                     # number of grid columns in the world
-    "n_robots": [1],                  # how many robots are spawned in each world
-    "n_targets": [10],                # how many targets must be collected in each run
-    "known_obstacle_density": [0.2],  # fraction of cells that start as known (visible) obstacles
-    "unknown_obstacle_density": [0.0, 0.1],  # fraction of cells that are hidden obstacles, discovered via sensing
-    "sense_radius": [1],              # Manhattan sensing radius for each robot’s local sensor
-    "max_steps": [200],               # maximum number of simulation ticks before we force-terminate a run
+    "rows": [20],
+    "cols": [20],
+    "n_robots": [1],
+    "n_targets": [10],
+    "known_obstacle_density": [0.2],
+    "unknown_obstacle_density": [0.0, 0.1],
+    "sense_radius": [1],
+    "max_steps": [200],
 
     # --- algorithms ---
-    # "path_algo_name": ["BFS","AStar","WAStar","GBFS","IDAStar","SMAStar"],
-    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],  # which pathfinding algorithms to compare
-
-    # "sharing_algo_name": ["RoundRobin","PSA","SSA","CA_Optimal","CA_Greedy","CA_IsingFull","CA_IsingLimited"],
-    "sharing_algo_name": ["CA_Optimal"],  # target-sharing algorithm (fixed here so we isolate pathfinding effects)
-
-    # "tour_algo_name": ["ExactBruteForce","CheapestInsertion","NearestNeighbor","IsingFull","IsingLimited"],
-    "tour_algo_name": ["ExactBruteForce"],  # tour/TSP algorithm used for PC(r, S) by SSA / CA_* (fixed to exact here)
+    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],
+    "sharing_algo_name": ["CA_Optimal"],
+    "tour_algo_name": ["ExactBruteForce"],
 
     # --- randomness ---
-    "seed": [i for i in range(10)],  # list of RNG seeds to generate different random worlds for each setting
+    "seed": [i for i in range(10)],
 }
 ```
 
@@ -184,19 +275,43 @@ Notes:
   For example:
   - `"rows": [20, 30]`  
   - `"cols": [20, 30]`  
-  runs 4 world shapes: (20×20), (20×30), (30×20), (30×30).
-- The **total experiment count** is the product of all list lengths, so be careful when adding many values — the number of runs grows exponentially.
-- `"purpose"` is a free-text label that gets written into every CSV row so you can later filter/group different batches.
+  generates 4 world shapes: (20×20), (20×30), (30×20), (30×30).
+- The total experiment count is `∏ len(values)` across all keys; small additions can lead to a large number of runs.
+- `"purpose"` is a free-text label written into every CSV row for later filtering or grouping.
+- `CPU_COUNT` controls the number of worker processes. If set to `None`, `multiprocessing.cpu_count()` is used.
 
-You can turn this grid into a “pathfinding sweep”, “sharing algo sweep”, or “tour sweep” by fixing some lists to length 1 and expanding others.
+### Batch driver (`batch_run.py`)
+
+`batch_run.py` uses `PARAM_GRID` to generate combinations, builds `Config` objects, and runs simulations without I/O:
+
+```bash
+python batch_run.py
+```
+
+Behaviour of `batch_run.py`:
+
+- Builds all parameter combinations from `PARAM_GRID`.
+- For each combination:
+  - creates `Config`, `WorldState`, and `Simulator`
+  - runs one simulation with `log_events=False`
+  - constructs the same nested `summary` dict as in `main.py`
+- Flattens `{params + summary}` into a single row per run.
+- Writes/appends rows to a CSV file under `outputs_batch/`:
+
+```text
+outputs_batch/
+└── batch_results.csv
+```
+
+If `outputs_batch/batch_results.csv` already exists, new experiments are appended using the existing header; the first run in a new file is executed synchronously in order to infer the CSV columns.
 
 ---
 
 ## Plotting batch results (`plot_utils.py`)
 
-Once you have `outputs_batch/batch_results.csv`, you can generate boxplots to compare algorithms using `plot_utils.py`.
+Once `outputs_batch/batch_results.csv` exists, algorithm comparison plots can be created using `plot_utils.py`.
 
-### CLI usage
+### Command-line usage
 
 ```bash
 python plot_utils.py
@@ -204,10 +319,10 @@ python plot_utils.py
 
 By default, `plot_utils.py`:
 
-- Uses `data_set = "pathfinding"` (see the constant at the bottom of the file).
+- Uses `data_set = "pathfinding"` (constant at the bottom of the file).
 - Reads `outputs_batch/batch_results.csv`.
-- Groups rows by `pathfinding.algorithm`.
-- Plots boxplots for:
+- Groups runs by `pathfinding.algorithm`.
+- Generates boxplots for:
   - `pathfinding.avg_runtime`
   - `simulation.total_distance`
 - Saves PDF plots under:
@@ -216,11 +331,11 @@ By default, `plot_utils.py`:
 outputs_batch/plots/
 ```
 
-To compare tours or sharing algorithms instead, change `data_set` inside `plot_utils.py` to `"tours"` or `"target_sharing"`.
+Changing `data_set` to `"tours"` or `"target_sharing"` switches the focus to tour or target-sharing algorithms; the script then groups by `tours.algorithm` or `target_sharing.algorithm` and adjusts the plotted metrics accordingly.
 
-### From Python
+### Programmatic usage
 
-You can also call it directly:
+`plot_utils.py` also exposes a function for use in notebooks or other scripts:
 
 ```python
 from plot_utils import plot_boxplots_from_csv
@@ -230,25 +345,28 @@ plot_boxplots_from_csv(
     group_by=["pathfinding.algorithm"],
     metrics=["pathfinding.avg_runtime", "simulation.total_distance"],
     output_dir="outputs_batch/plots",
-    show=False,  # set True to pop up windows instead of just saving PDFs
+    show=False,
     x_axis_label="Pathfinding algorithm",
 )
 ```
 
-This is useful if you want to script multiple plots (e.g., one per `purpose`, or separate plots for different grid sizes) inside a notebook.
+This makes it straightforward to script multiple plots, e.g., separate comparisons by `purpose`, grid size, or obstacle density.
 
 ---
 
 ## High-level structure
 
 ```text
-main.py         # Entry point: builds config, runs one simulation, saves outputs
-config.py       # Config dataclass (grid size, robot count, etc.)
+main.py         # Entry point: builds Config, runs one simulation, saves outputs
+config.py       # Config dataclass (world size, robot count, algorithms, logging)
 env.py          # World & robot state, grid generation, obstacles, visibility
 sim.py          # Simulator loop, auctions, replanning, metrics, history
 viz.py          # Static world visualization (PNGs)
 animate.py      # GIF animation from simulation history
 io_utils.py     # Run directory helper, config/summary writers
+
+batch_config.py # Batch CPU + PARAM_GRID configuration
+batch_run.py    # Batch driver: runs many experiments, writes CSV
 plot_utils.py   # Helper for plotting batch_results.csv (boxplots)
 
 pathfinding/    # Path planners (BFS, A*, WAStar, GBFS, IDAStar, SMAStar, ...)
@@ -259,8 +377,8 @@ outputs/        # Per-run outputs (config.json, world_initial.png, world_final.p
 outputs_batch/  # Batch experiment CSV (batch_results.csv) and plots/
 ```
 
-Each of the algorithm folders is auto-discovered: any file that exposes  
-`ALGORITHM = YourClass()` with a unique `.name` will be picked up and can be selected by that name in `main.py`.
+Each algorithm folder is auto-discovered: any file that exposes  
+`ALGORITHM = YourClass()` with a unique `.name` is picked up and can be selected by that name in `config.py` (`path_algo_name`, `sharing_algo_name`, `tour_algo_name`).
 
 ---
 
@@ -275,25 +393,33 @@ Some algorithms rely on the `dwave-tabu` package:
 
 If `dwave-tabu` (module `tabu`) is not installed:
 
-- The Ising-based algorithms will raise a clear `RuntimeError`, and
-- You can simply switch to classical baselines such as `"CA_Greedy"` or `"CheapestInsertion"`.
+- The Ising-based algorithms raise a clear `RuntimeError`, and
+- Classical baselines such as `"CA_Greedy"` or `"CheapestInsertion"` remain available.
 
-To enable them:
+To enable the Ising-based components:
 
 ```bash
 pip install dwave-tabu
 ```
 
-Then select the corresponding algorithm names in `main.py` as shown above.
+The corresponding algorithm names can then be selected in `config.py`.
 
 ---
 
-## Extending the framework
+## Extensibility
 
-You can extend the framework in several ways:
+The framework is designed to be extensible:
 
-- **New pathfinding algorithms**: add a new file in `pathfinding/` that implements `PathfindingAlgorithm` and exposes `ALGORITHM`.
-- **New auction / sharing strategies**: add a new file in `target_sharing/` that implements `TargetSharingAlgorithm` and exposes `ALGORITHM`.
-- **New tour solvers**: add a new file in `tours/` that implements `TourAlgorithm` and exposes `ALGORITHM`.
+- **New pathfinding algorithms**  
+  Add a new file in `pathfinding/` that implements the `PathfindingAlgorithm` protocol and exposes `ALGORITHM = Instance`.  
+  The `.name` field of the class becomes the value used in `Config.path_algo_name`.
 
-As long as you follow the existing interfaces and naming conventions, your new algorithms will automatically appear as options via their `.name` in `main.py`.
+- **New auction / target-sharing strategies**  
+  Add a new file in `target_sharing/` implementing `TargetSharingAlgorithm` and exposing `ALGORITHM`.  
+  The simulator then treats it as another option for `Config.sharing_algo_name`.
+
+- **New tour solvers**  
+  Add a new file in `tours/` implementing `TourAlgorithm` and exposing `ALGORITHM`.  
+  The `.name` becomes an option for `Config.tour_algo_name`.
+
+As long as the existing interfaces and naming conventions are respected, new algorithms integrate automatically with `main.py`, `batch_run.py`, and the plotting pipeline.

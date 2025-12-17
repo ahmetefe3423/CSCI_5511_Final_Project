@@ -14,6 +14,8 @@ Tour solvers are used by:
 - `SSA` (Sequential Single-Item Auction) in `target_sharing/ssa.py`
 - Combinatorial auctions (`CA_Optimal`, `CA_Greedy`, `CA_IsingFull`, `CA_IsingLimited`)
 
+The algorithm is selected by the `tour_algo_name` field of the `Config` dataclass in `config.py` (single-run experiments) and by the `tour_algo_name` entry in `PARAM_GRID` in `batch_config.py` (batch experiments).
+
 ---
 
 ## Available algorithms
@@ -31,7 +33,7 @@ Tour solvers are used by:
 - Classic insertion heuristic:
   - Starts from a small tour
   - Repeatedly inserts a new target in the position that causes the smallest increase in tour cost
-- Better tour quality than NearestNeighbor in many cases, still efficient for small target sets
+- Often yields better tour quality than NearestNeighbor, still efficient for small target sets
 
 ---
 
@@ -74,7 +76,7 @@ pip install dwave-tabu
     - total anneal time
     - total energy
 
-Hardware metrics are stored in `summary.json` under `"tours"["hardware"]`.
+Hardware metrics are stored in `summary.json` under `"tours"["hardware"]` and in the batch-results CSV.
 
 Also requires `dwave-tabu`.
 
@@ -106,30 +108,72 @@ Behavior:
 - `solve(...)` returns:
   - `order`: list of targets in visit order
   - `cost`: total tour cost (sum of shortest path lengths between legs)
-- If no valid tour exists (some targets unreachable), it should return:
+- If no valid tour exists (some targets are unreachable), it returns:
   - `order = []`
-  - `cost = float('inf')`
+  - `cost = float("inf")`
 - Runtime measurement:
   - `total_runtime` – total wall-clock seconds spent in `solve`
   - `call_count` – number of times `solve` was called
 
-The simulator uses these statistics in `summary.json` and batch results.
+The simulator records these statistics in `summary.json` (single runs) and in `outputs_batch/batch_results.csv` (batch runs).
 
 ---
 
-## Using tour algorithms in `batch_run.py`
+## Tour configuration in single runs (`config.py`)
 
-To compare tour/TSP solvers systematically, use `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
-
-In `batch_run.py` the tour dimension is controlled by:
+For simulations driven by `main.py`, the tour algorithm is selected via `Config.tour_algo_name` in `config.py`:
 
 ```python
-PARAM_GRID: Dict[str, List[Any]] = {
+# config.py
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Config:
     # ...
+    # Tour (TSP-style) solver, used by SSA / CA_*
+    #   None                – no tour model (single-target distances only)
+    #   "NearestNeighbor"   – greedy TSP heuristic
+    #   "CheapestInsertion" – insertion heuristic TSP
+    #   "ExactBruteForce"   – exact tour (small target sets)
+    #   "IsingFull"         – Ising-based tour via TabuSampler
+    #   "IsingLimited"      – hardware-limited Ising tour
+    tour_algo_name: Optional[str] = "CheapestInsertion"
+```
+
+If `tour_algo_name` is `None`, sharing algorithms that do not require tours (for example, PSA, RoundRobin) operate without a TSP solver.
+
+---
+
+## Tour algorithms in batch experiments (`batch_run.py` + `batch_config.py`)
+
+Systematic comparison of tour/TSP solvers is carried out by `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`. The grid is defined in `batch_config.py`.
+
+Example configuration for the tour dimension:
+
+```python
+# batch_config.py
+from typing import Dict, List, Any
+
+CPU_COUNT: int | None = None  # None -> use all available cores
+
+PARAM_GRID: Dict[str, List[Any]] = {
+    # --- meta ---
+    "purpose": ["tour_algorithm_comparison"],
+
+    # --- world parameters ---
+    "rows": [20],
+    "cols": [20],
+    "n_robots": [2],
+    "n_targets": [8],
+    "known_obstacle_density": [0.2],
+    "unknown_obstacle_density": [0.0, 0.1],
+    "sense_radius": [1],
+    "max_steps": [200],
 
     # --- algorithms ---
-    "path_algo_name": ["AStar"],     # fix pathfinding if you want to isolate tour effects
-    "sharing_algo_name": ["SSA"],    # or a CA_* variant that uses tours
+    "path_algo_name": ["AStar"],      # fixed pathfinding to isolate tour effects
+    "sharing_algo_name": ["SSA"],     # or a CA_* variant that uses tours
     "tour_algo_name": [
         "NearestNeighbor",
         "CheapestInsertion",
@@ -138,45 +182,64 @@ PARAM_GRID: Dict[str, List[Any]] = {
         "IsingLimited",
     ],
 
-    # ...
+    # --- randomness ---
+    "seed": [i for i in range(10)],
 }
 ```
 
 Notes:
 
 - `PARAM_GRID` runs **all combinations** of the lists.  
-  If you keep `path_algo_name` and `sharing_algo_name` at length 1 and only expand `tour_algo_name`, you get a clean **tour sweep** on the same worlds and assignments.
-- Each run contributes a row where:
-  - `tours.algorithm` is the algorithm’s `name`
-  - `tours.total_runtime` / `tours.avg_runtime` capture tour-solving cost
-  - `targets.collected`, `simulation.total_distance`, and `simulation.makespan_tick` reflect the impact of tour quality on global performance
-  - For Ising-based methods, `tours.hardware.*` records the simulated hardware time/energy.
+  Fixing `path_algo_name` and `sharing_algo_name` and expanding only `tour_algo_name` produces a tour sweep on matched worlds and target allocations.
+- For each run, the batch driver records:
+  - `tours.algorithm` – algorithm name
+  - `tours.call_count`, `tours.total_runtime`, `tours.avg_runtime`
+  - `targets.collected`, `simulation.total_distance`, `simulation.makespan_tick`
+  - For Ising-based methods, `tours.hardware.*` with simulated hardware time and energy.
 
-You can visualize these comparisons with `plot_utils.py`, for example:
+The script `plot_utils.py` can then be invoked with `data_set = "tours"` so that boxplots of `tours.avg_runtime` and `simulation.total_distance` are grouped by `tours.algorithm`.
 
-```bash
-python plot_utils.py
+Example programmatic call:
+
+```python
+from plot_utils import plot_boxplots_from_csv
+
+plot_boxplots_from_csv(
+    csv_path="outputs_batch/batch_results.csv",
+    group_by=["tours.algorithm"],
+    metrics=["tours.avg_runtime", "simulation.total_distance"],
+    output_dir="outputs_batch/plots",
+    show=False,
+    x_axis_label="Tour algorithm",
+)
 ```
-
-with `data_set = "tours"` to get boxplots of `tours.avg_runtime` and `simulation.total_distance` grouped by `tours.algorithm`.
 
 ---
 
-## Selecting a tour algorithm
+## Selecting a tour algorithm in `main.py`
 
-In `main.py`, choose the tour algorithm by name, for algorithms that use tours (SSA, CA_*): 
+In `main.py`, the simulator is constructed from the configuration; the tour algorithm name is taken from `cfg.tour_algo_name`:
 
 ```python
-tour_algo_name = "CheapestInsertion"  # or "NearestNeighbor", "ExactBruteForce", "IsingFull", "IsingLimited", ...
+cfg = Config()
+
+sim = Simulator(
+    cfg=cfg,
+    world=world,
+    path_algo_name=cfg.path_algo_name,
+    sharing_algo_name=cfg.sharing_algo_name,
+    tour_algo_name=cfg.tour_algo_name,
+    log_events=cfg.log_events,
+)
 ```
 
-Set `tour_algo_name = None` to run sharing algorithms that don’t need tours (e.g. PSA, RoundRobin).
+Any `tour_algo_name` value of `None` disables tours (only sharing algorithms that do not require tours should be used in this case). Otherwise, the name must match the `.name` field of one of the algorithms in this folder.
 
 ---
 
 ## Adding a new tour algorithm
 
-To add your own TSP / tour solver:
+To add an additional TSP / tour solver:
 
 1. Create a new file in this folder, for example `my_tour.py`.
 2. Implement a class that follows the interface:
@@ -211,7 +274,7 @@ class MyTour(TourAlgorithm):
     ) -> tuple[list[Pos], float]:
         t0 = perf_counter()
 
-        # TODO: your tour logic here
+        # Tour construction logic
         order: list[Pos] = list(targets)
         cost: float = 0.0
 
@@ -221,28 +284,18 @@ class MyTour(TourAlgorithm):
         return order, cost
 ```
 
-3. At the bottom of the file, expose your algorithm:
+3. At the bottom of the file, expose the algorithm:
 
 ```python
 ALGORITHM = MyTour()
 ```
 
-4. `tours/__init__.py` will auto-discover and register it by `MyTour.name`.
-5. You can then select it in `main.py`:
-
-```python
-tour_algo_name = "MyTour"
-```
-
-6. To include it in batch experiments, add its name to `PARAM_GRID["tour_algo_name"]` in `batch_run.py` and re-run:
-
-```python
-"tour_algo_name": ["CheapestInsertion", "MyTour"]
-```
+4. `tours/__init__.py` auto-discovers and registers it under `MyTour.name`.
+5. The new solver then becomes available via `Config.tour_algo_name = "MyTour"` in `config.py` and may be added to `PARAM_GRID["tour_algo_name"]` in `batch_config.py` for batch experiments.
 
 ---
 
 ## Notes
 
-- Tour solvers use **grid distances** computed via the selected pathfinding algorithm (BFS/A*), so they automatically respect discovered obstacles.
-- Ising-based algorithms are more computationally heavy and are best used on small target sets, or mainly for comparison/baseline experiments.
+- Tour solvers use **grid distances** computed via the selected pathfinding algorithm (for example, BFS or A*), so they automatically respect discovered obstacles.
+- Ising-based algorithms are computationally heavier and are most appropriate for small target sets or for comparison/baseline experiments against classical heuristics.

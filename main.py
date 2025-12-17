@@ -8,101 +8,51 @@ from sim import Simulator
 from animate import animate_run
 
 
-def main():
-    """Run a single simulation and write results to the outputs/ folder.
+def main() -> None:
+    """
+    Single-run entry point for the multi-robot gridworld simulator.
 
-    High-level steps:
-      1. Build a Config object describing the grid, robots, and targets.
-      2. Choose algorithms by name (pathfinding, target sharing, tour).
-      3. Create a unique run directory under ``outputs/``.
-      4. Instantiate the world and simulator.
-      5. Run the simulation loop until all targets are collected or max_steps is reached.
-      6. Save summary metrics, static PNGs, and an animation GIF into the run directory.
+    Typical usage for a user:
+      1. Open config.py and edit the Config defaults
+         (world size, densities, number of robots/targets, algorithm names, ...).
+      2. Run:
+             python main.py
+      3. Inspect the output folder under outputs/ (PNG, GIF, summary.json).
     """
 
-    # -----------------------------------------------------------------------
-    # World / experiment configuration
-    # -----------------------------------------------------------------------
-    cfg = Config(
-        rows=20,                 # number of grid rows (y-dimension)
-        cols=20,                 # number of grid columns (x-dimension)
-        n_robots=3,              # how many robots to spawn near the spawn point
-        n_targets=10,             # how many targets must be visited in this run
-        known_obstacle_density=0.25,  # fraction of cells that start as known obstacles
-        unknown_obstacle_density=0.1, # fraction of cells that are hidden obstacles (discovered when sensed)
-        sense_radius=1,          # Manhattan radius of each robot's local sensor
-        seed=1,                  # RNG seed for reproducible world generation
-        max_steps=200,           # hard cap on simulation ticks; run stops even if targets remain
-    )
+    # ------------------------------------------------------------------
+    # 1) Build configuration from config.py
+    # ------------------------------------------------------------------
+    # Normal usage: just instantiate Config() and rely on the defaults
+    # declared in config.py. Users are expected to edit config.py instead
+    # of this file.
+    cfg = Config()
 
-    # -----------------------------------------------------------------------
-    # Algorithm choices
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 2) Algorithm choices (prefer to read from cfg)
+    # ------------------------------------------------------------------
+    # If config.py has algorithm fields (recommended), use them.
+    # For backward compatibility, fall back to sensible defaults if they
+    # don't exist yet.
+    #
+    # Valid names are documented in:
+    #   - pathfinding README (BFS, AStar, WAStar, GBFS, IDAStar, SMAStar, ...)
+    #   - target_sharing README (RoundRobin, PSA, SSA, CA_*, ...)
+    #   - tours README (NearestNeighbor, CheapestInsertion, ExactBruteForce,
+    #                  IsingFull, IsingLimited, ...)
+    path_algo_name = getattr(cfg, "path_algo_name", "AStar")
+    sharing_algo_name = getattr(cfg, "sharing_algo_name", "PSA")
+    tour_algo_name = getattr(cfg, "tour_algo_name", "CheapestInsertion")
 
-    # Pathfinding algorithm (see pathfinding/README.md):
-    #
-    #   "BFS"      - Breadth-first search baseline (unweighted shortest paths).
-    #   "AStar"    - A* with Manhattan heuristic (optimal).
-    #   "WAStar"   - Weighted A* (bounded-suboptimal, typically fewer expansions than A*).
-    #   "GBFS"     - Greedy best-first search (very fast, not optimal).
-    #   "IDAStar"  - Iterative Deepening A* (low memory, optimal but may re-expand many nodes).
-    #   "SMAStar"  - Simplified memory-bounded A* (limits OPEN size; trades completeness/optimality for memory).
-    path_algo_name = "AStar"
+    # Enable textual logs when running via main.py.
+    # If Config has log_events, use that; otherwise default to True here.
+    log_events = getattr(cfg, "log_events", True)
 
-    # Target-sharing (auction) algorithm (see target_sharing/README.md):
-    #
-    #   "RoundRobin"      - Baseline: assigns targets in round-robin order (ignores distances).
-    #
-    #   "PSA"             - Parallel Single-Item Auction:
-    #                         each target is auctioned independently, in parallel;
-    #                         bids are based on single-target path length.
-    #
-    #   "SSA"             - Sequential Single-Item Auction:
-    #                         considers the marginal cost of inserting each target
-    #                         into a robot's tour PC(r, S) using a tour algorithm.
-    #
-    #   "CA_Optimal"      - Single-round Combinatorial Auction:
-    #                         enumerates all assignments (small instances only) and
-    #                         chooses the assignment that minimizes total tour cost.
-    #
-    #   "CA_Greedy"       - Greedy Combinatorial Auction:
-    #                         approximates CA_Optimal by greedily accepting low-cost
-    #                         bundles (size 1 or 2) that don't conflict.
-    #
-    #   "CA_IsingFull"    - Combinatorial auction where bundle selection is done
-    #                         via a full-precision Ising/QUBO model solved by TabuSampler.
-    #
-    #   "CA_IsingLimited" - Same as above but with integer QUBO coefficients in [-7, 7],
-    #                         simulating a 49-spin, 50µs, 24mW hardware constraint and
-    #                         tracking approximate anneal time and energy usage.
-    sharing_algo_name = "SSA"
-
-    # Tour / TSP algorithm for PC(r, S) (see tours/README.md).
-    #
-    # This is only used when the sharing algorithm needs tour costs:
-    #   - "SSA"
-    #   - "CA_Optimal"
-    #   - "CA_Greedy"
-    #   - "CA_IsingFull"
-    #   - "CA_IsingLimited"
-    #
-    # For "RoundRobin" and "PSA", the tour algorithm is ignored.
-    #
-    # Options:
-    #   "NearestNeighbor"    - Greedy nearest-neighbor heuristic (fast, approximate).
-    #   "ExactBruteForce"    - Exact TSP solver for small target sets (exponential time).
-    #   "CheapestInsertion"  - Insertion heuristic similar to what many papers use.
-    #   "IsingFull"          - QUBO / Ising tour via TabuSampler (no artificial limits).
-    #   "IsingLimited"       - Hardware-style Ising tour: integer coeffs in [-7, 7],
-    #                            simulated 49-spin, 50µs, 24mW hardware with energy stats.
-    tour_algo_name = "CheapestInsertion"
-
-    # From here on:
-    #   - create an output directory for this run,
-    #   - build the world and simulator,
-    #   - execute the simulation loop,
-    #   - collect metrics, and
-    #   - write JSON + PNG + GIF outputs into the run directory.
+    # ------------------------------------------------------------------
+    # 3) Create output directory and save config
+    # ------------------------------------------------------------------
+    # make_run_dir builds something like:
+    #   outputs/run_R20x20_Rob2_Tgt10_seed1_YYYYMMDD-HHMMSS-<uid>/
     run_dir = make_run_dir(
         cfg,
         base="outputs",
@@ -111,45 +61,118 @@ def main():
         tour_algo_name=tour_algo_name,
     )
 
+    # Save config.json so every run is reproducible.
     save_config(cfg, run_dir)
 
+    # ------------------------------------------------------------------
+    # 4) Build world and simulator
+    # ------------------------------------------------------------------
+    # WorldState.from_config uses cfg.rows, cfg.cols, obstacle densities,
+    # seed, etc. to generate a connected grid with robots, targets, and
+    # known/unknown obstacles.
     world = WorldState.from_config(cfg)
 
-    # --- record targets both as positions and as count ---
-    initial_target_cells = set(world.targets)       # for animation
-    initial_target_count = len(world.targets)       # for summary
+    # Keep the initial target set for animation + summary.
+    initial_target_cells = set(world.targets)
+    initial_target_count = len(world.targets)
 
-    # initial snapshot
+    # Draw the initial world BEFORE any robot moves.
     draw_world(world, cfg, out_path=run_dir / "world_initial.png")
 
+    # Create the simulator object, wiring together:
+    #   - the world state
+    #   - configuration (max_steps, etc.)
+    #   - the chosen pathfinding / sharing / tour algorithms by name
+    #   - log_events=True so we see tick-by-tick and planning logs
     sim = Simulator(
         cfg=cfg,
         world=world,
         path_algo_name=path_algo_name,
         sharing_algo_name=sharing_algo_name,
         tour_algo_name=tour_algo_name,
+        log_events=log_events,
     )
 
+    # Reset timing statistics for this run so total_runtime/call_count
+    # reflect only this simulation.
+    sim.path_algo.reset_stats()
+    sim.sharing_algo.reset_stats()
+    if getattr(sim, "tour_algo", None) is not None:
+        sim.tour_algo.reset_stats()
+
+    # ------------------------------------------------------------------
+    # 5) Run simulation until completion or max_steps
+    # ------------------------------------------------------------------
+    # The simulator moves robots, runs target-sharing, and replans paths
+    # when necessary, until:
+    #   - all targets are collected, or
+    #   - cfg.max_steps is reached, or
+    #   - robots become stuck.
     sim.run()
 
-    # --- summarize pathfinding metrics ---
+    # Draw the final world AFTER the simulation completes.
+    draw_world(world, cfg, out_path=run_dir / "world_final.png")
+
+    # ------------------------------------------------------------------
+    # 6) Build summary dictionary with metrics + algorithm stats
+    # ------------------------------------------------------------------
     pa = sim.path_algo
-    pf_entry = {
+    sa = sim.sharing_algo
+    ta = getattr(sim, "tour_algo", None)
+
+    # Per-robot distance stats
+    dist_by_robot = sim.robot_distances
+    dist_values = list(dist_by_robot.values())
+    total_dist_check = sum(dist_values) if dist_values else 0
+
+    max_dist = max(dist_values) if dist_values else 0
+    min_dist = min(dist_values) if dist_values else 0
+    avg_dist = total_dist_check / len(dist_values) if dist_values else 0
+    imbalance = max_dist - min_dist
+
+    summary: dict = {
+        "grid": {"rows": cfg.rows, "cols": cfg.cols},
+        "robots": {"count": cfg.n_robots},
+        "targets": {
+            "initial": initial_target_count,
+            "remaining": len(world.targets),
+            "collected": initial_target_count - len(world.targets),
+        },
+        "simulation": {
+            "ticks": sim.ticks,
+            "max_steps": cfg.max_steps,
+            "total_distance": sim.total_distance,
+            # Sanity check: recompute distance from per-robot totals.
+            "total_distance_check_from_robots": total_dist_check,
+            "makespan_tick": sim.last_collection_tick,
+            "all_targets_collected": (len(world.targets) == 0),
+        },
+        "per_robot_distance": {
+            "by_robot": dist_by_robot,
+            "max": max_dist,
+            "min": min_dist,
+            "avg": avg_dist,
+            "imbalance": imbalance,
+        },
+    }
+
+    # ---- Pathfinding metrics ----
+    summary["pathfinding"] = {
         "algorithm": pa.name,
         "call_count": pa.call_count,
         "total_runtime": pa.total_runtime,
         "avg_runtime": (pa.total_runtime / pa.call_count) if pa.call_count else 0.0,
     }
 
-    # --- summarize target sharing metrics (plus hardware if available) ---
-    sa = sim.sharing_algo
-    ts_entry = {
+    # ---- Target sharing metrics (plus hardware if available) ----
+    ts_entry: dict = {
         "algorithm": sa.name,
         "call_count": sa.call_count,
         "total_runtime": sa.total_runtime,
         "avg_runtime": (sa.total_runtime / sa.call_count) if sa.call_count else 0.0,
     }
 
+    # Optional hardware metrics used by Ising-based sharing algorithms.
     if hasattr(sa, "total_hw_anneal_time"):
         ts_entry["hardware"] = {
             "total_anneal_time_s": sa.total_hw_anneal_time,
@@ -161,33 +184,18 @@ def main():
             "power_W": sa.HW_POWER_W,
         }
 
-    summary = {
-        "grid": {"rows": cfg.rows, "cols": cfg.cols},
-        "robots": {"count": cfg.n_robots},
-        "targets": {
-            "initial": initial_target_count,
-            "remaining": len(world.targets),
-            "collected": initial_target_count - len(world.targets),
-        },
-        "simulation": {
-            "ticks": sim.ticks,
-            "max_steps": cfg.max_steps,
-            "terminated_early": sim.ticks < cfg.max_steps,
-        },
-        "pathfinding": pf_entry,
-        "target_sharing": ts_entry,
-    }
+    summary["target_sharing"] = ts_entry
 
-    # Tours metrics (plus hardware if available, e.g. IsingLimitedTour)
-    ta = sim.tour_algo
+    # ---- Tours metrics (plus hardware / SNN if available) ----
     if ta is not None:
-        tours_entry = {
+        tours_entry: dict = {
             "algorithm": ta.name,
             "call_count": ta.call_count,
             "total_runtime": ta.total_runtime,
             "avg_runtime": (ta.total_runtime / ta.call_count) if ta.call_count else 0.0,
         }
 
+        # Optional hardware metrics for Ising-based tour solvers.
         if hasattr(ta, "total_hw_anneal_time"):
             tours_entry["hardware"] = {
                 "total_anneal_time_s": ta.total_hw_anneal_time,
@@ -199,6 +207,7 @@ def main():
                 "power_W": ta.HW_POWER_W,
             }
 
+        # Optional SNN-style simulation metrics (if present on tour object).
         if hasattr(ta, "total_sim_time"):
             tours_entry["SNN"] = {
                 "total_event_count": ta.total_event_count,
@@ -207,15 +216,21 @@ def main():
 
         summary["tours"] = tours_entry
 
+    # Save the metrics to summary.json in the run directory.
     save_summary(summary, run_dir)
 
-    # --- build GIF animation ---
+    # ------------------------------------------------------------------
+    # 7) Build GIF animation of the entire run
+    # ------------------------------------------------------------------
     gif_path = run_dir / "animation.gif"
     animate_run(world, cfg, sim.history, initial_target_cells, out_path=gif_path, fps=5)
 
     print(f"Run directory: {run_dir}")
     print(f"Animation saved to: {gif_path}")
-    print(f"Targets collected: {summary['targets']['collected']} / {summary['targets']['initial']}")
+    print(
+        f"Targets collected: {summary['targets']['collected']} "
+        f"/ {summary['targets']['initial']}"
+    )
 
 
 if __name__ == "__main__":
