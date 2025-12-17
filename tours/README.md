@@ -113,7 +113,52 @@ Behavior:
   - `total_runtime` – total wall-clock seconds spent in `solve`
   - `call_count` – number of times `solve` was called
 
-The simulator uses these statistics in `summary.json`.
+The simulator uses these statistics in `summary.json` and batch results.
+
+---
+
+## Using tour algorithms in `batch_run.py`
+
+To compare tour/TSP solvers systematically, use `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
+
+In `batch_run.py` the tour dimension is controlled by:
+
+```python
+PARAM_GRID: Dict[str, List[Any]] = {
+    # ...
+
+    # --- algorithms ---
+    "path_algo_name": ["AStar"],     # fix pathfinding if you want to isolate tour effects
+    "sharing_algo_name": ["SSA"],    # or a CA_* variant that uses tours
+    "tour_algo_name": [
+        "NearestNeighbor",
+        "CheapestInsertion",
+        "ExactBruteForce",
+        "IsingFull",
+        "IsingLimited",
+    ],
+
+    # ...
+}
+```
+
+Notes:
+
+- `PARAM_GRID` runs **all combinations** of the lists.  
+  If you keep `path_algo_name` and `sharing_algo_name` at length 1 and only expand `tour_algo_name`, you get a clean **tour sweep** on the same worlds and assignments.
+- Each run contributes a row where:
+  - `tours.algorithm` is the algorithm’s `name`
+  - `tours.total_runtime` / `tours.avg_runtime` capture tour-solving cost
+  - `targets.collected`, `simulation.total_distance`, and `simulation.makespan_tick` reflect the impact of tour quality on global performance
+  - For Ising-based methods, `tours.hardware.*` records the simulated hardware time/energy.
+
+You can visualize these comparisons with `plot_utils.py`, for example:
+
+```bash
+python plot_utils.py
+```
+
+with `data_set = "tours"` to get boxplots of `tours.avg_runtime` and `simulation.total_distance` grouped by `tours.algorithm`.
 
 ---
 
@@ -187,6 +232,12 @@ ALGORITHM = MyTour()
 
 ```python
 tour_algo_name = "MyTour"
+```
+
+6. To include it in batch experiments, add its name to `PARAM_GRID["tour_algo_name"]` in `batch_run.py` and re-run:
+
+```python
+"tour_algo_name": ["CheapestInsertion", "MyTour"]
 ```
 
 ---

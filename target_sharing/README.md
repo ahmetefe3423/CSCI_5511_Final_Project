@@ -127,9 +127,56 @@ Behavior:
   - `total_runtime` – total seconds spent across all calls
   - `call_count` – number of times `assign` was invoked
 
-The simulator logs these stats to `summary.json`.
+The simulator logs these stats to `summary.json` and to `outputs_batch/batch_results.csv` in batch runs.
 
 Many algorithms (SSA, CA_*) also depend on a `TourAlgorithm` from the `tours/` folder; the simulator injects the chosen tour algorithm via a setter like `set_tour_algo`.
+
+---
+
+## Using target-sharing algorithms in `batch_run.py`
+
+To compare target-sharing strategies systematically, use `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
+
+In `batch_run.py` the sharing dimension is controlled by:
+
+```python
+PARAM_GRID: Dict[str, List[Any]] = {
+    # ...
+
+    # --- algorithms ---
+    "path_algo_name": ["AStar"],  # fix pathfinding if you want to isolate sharing effects
+    "sharing_algo_name": [
+        "RoundRobin",
+        "PSA",
+        "SSA",
+        "CA_Optimal",
+        "CA_Greedy",
+        "CA_IsingFull",
+        "CA_IsingLimited",
+    ],
+    "tour_algo_name": ["CheapestInsertion"],  # or "ExactBruteForce" for small instances
+
+    # ...
+}
+```
+
+Notes:
+
+- `PARAM_GRID` runs **all combinations** of the lists.  
+  If you keep `path_algo_name` and `tour_algo_name` at length 1 and only expand `sharing_algo_name`, you get a clean **target-sharing sweep** on the same worlds.
+- Each run contributes a row where:
+  - `target_sharing.algorithm` is the algorithm’s `name`
+  - `target_sharing.total_runtime` / `target_sharing.avg_runtime` capture its allocation cost
+  - `targets.collected`, `simulation.total_distance`, and `simulation.makespan_tick` capture the effect on task completion and efficiency
+  - For Ising-based methods, `target_sharing.hardware.*` records the simulated hardware time/energy.
+
+You can visualize these comparisons with `plot_utils.py`, for example:
+
+```bash
+python plot_utils.py
+```
+
+with `data_set = "target_sharing"` to get boxplots of `target_sharing.avg_runtime` and `simulation.total_distance` grouped by `target_sharing.algorithm`.
 
 ---
 
@@ -199,6 +246,12 @@ ALGORITHM = MyAuction()
 sharing_algo_name = "MyAuction"
 ```
 
+6. To include it in batch experiments, add its name to `PARAM_GRID["sharing_algo_name"]` in `batch_run.py` and re-run:
+
+```python
+"sharing_algo_name": ["PSA", "CA_Greedy", "MyAuction"]
+```
+
 ---
 
 ## Notes
@@ -206,3 +259,4 @@ sharing_algo_name = "MyAuction"
 - All algorithms operate on the **current belief world** (robots only know discovered + known obstacles).
 - Replanning events (e.g. when an unknown obstacle blocks a path) trigger calls to `assign(...)` again with the remaining targets.
 - If you introduce new heuristics (e.g. distance thresholds, local vs global auctions), keep the input/output interface identical so the simulator can use your algorithm without changes.
+- For fair comparison in batch experiments, make sure your implementation updates `total_runtime` and `call_count` just like the existing algorithms.

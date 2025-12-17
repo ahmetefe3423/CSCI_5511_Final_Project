@@ -75,7 +75,47 @@ Behavior:
   - `total_runtime` – accumulated seconds spent in `plan`
   - `call_count` – how many times `plan` was called
   - (Many implementations also track `last_runtime`)
-- The simulator uses these fields for performance statistics in `summary.json` and batch results.
+- The simulator uses these fields for performance statistics in `summary.json` and **batch results**.
+
+---
+
+## Using pathfinding algorithms in `batch_run.py`
+
+To compare these algorithms systematically, use `batch_run.py`, which sweeps over a parameter grid and writes all results to `outputs_batch/batch_results.csv`.
+
+In `batch_run.py` the pathfinding dimension is controlled by:
+
+```python
+PARAM_GRID: Dict[str, List[Any]] = {
+    # ...
+
+    # --- algorithms ---
+    # "path_algo_name": ["BFS","AStar","WAStar","GBFS","IDAStar","SMAStar"],
+    "path_algo_name": ["BFS", "AStar", "WAStar", "GBFS", "IDAStar", "SMAStar"],  # which pathfinding algorithms to compare
+
+    # Fix sharing/tour algorithms if you want to isolate pathfinding effects:
+    "sharing_algo_name": ["CA_Optimal"],
+    "tour_algo_name": ["ExactBruteForce"],
+
+    # ...
+}
+```
+
+Notes:
+
+- `PARAM_GRID` runs **all combinations** of the lists. If you keep `sharing_algo_name` and `tour_algo_name` at length 1 and only expand `path_algo_name`, you get a clean **pathfinding sweep** on the same worlds.
+- Each run contributes a row where:
+  - `pathfinding.algorithm` is the algorithm’s `name`
+  - `pathfinding.total_runtime` / `pathfinding.avg_runtime` capture its planning cost
+  - `simulation.total_distance` and `simulation.makespan_tick` capture the effect on overall performance
+
+You can then visualize these comparisons with `plot_utils.py`, for example:
+
+```bash
+python plot_utils.py
+```
+
+with `data_set = "pathfinding"` to get boxplots of `pathfinding.avg_runtime` and `simulation.total_distance` grouped by `pathfinding.algorithm`.
 
 ---
 
@@ -130,6 +170,12 @@ ALGORITHM = MyPlanner()
 path_algo_name = "MyPlanner"
 ```
 
+6. To include it in batch experiments, add its name to `PARAM_GRID["path_algo_name"]` in `batch_run.py` and re-run:
+
+```python
+"path_algo_name": ["BFS", "AStar", "MyPlanner"]
+```
+
 ---
 
 ## Notes
@@ -141,4 +187,4 @@ path_algo_name = "MyPlanner"
   - grid boundaries,
   - obstacles encoded in `world` (via `visible_obstacles()` or `neighbors4_visible()`),
   - and the common return convention: a simple list of `(x, y)` positions, `[]` if no path exists.
-- More advanced incremental algorithms (e.g., D* Lite, LPA*) can be added as long as they fit the same `plan(world, start, goal) -> list[Pos]` interface.
+- More advanced incremental algorithms (e.g., D* Lite, LPA*) can be added as long as they fit the same `plan(world, start, goal) -> list[Pos]` interface and expose timing stats so they can be compared fairly in `summary.json` and `batch_results.csv`.
